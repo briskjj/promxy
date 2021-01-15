@@ -37,7 +37,6 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
-	sd_config "github.com/prometheus/prometheus/discovery/config"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/pkg/relabel"
 	"github.com/prometheus/prometheus/promql"
@@ -237,9 +236,10 @@ func main() {
 	reloadables = append(reloadables, proxyconfig.WrapPromReloadable(notifierManager))
 
 	discoveryManagerNotify := discovery.NewManager(ctx, kitlog.With(logger, "component", "discovery manager notify"))
+
 	reloadables = append(reloadables,
 		proxyconfig.WrapPromReloadable(&proxyconfig.ApplyConfigFunc{func(cfg *config.Config) error {
-			c := make(map[string]sd_config.ServiceDiscoveryConfig)
+			c := make(map[string]discovery.Configs)
 			for _, v := range cfg.AlertingConfig.AlertmanagerConfigs {
 				// AlertmanagerConfigs doesn't hold an unique identifier so we use the config hash as the identifier.
 				b, err := json.Marshal(v)

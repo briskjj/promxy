@@ -12,13 +12,14 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/timestamp"
-	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/sirupsen/logrus"
 
+	"github.com/prometheus/prometheus/storage/remote"
+
 	"github.com/jacksontj/promxy/pkg/logging"
 	"github.com/jacksontj/promxy/pkg/promhttputil"
-	"github.com/jacksontj/promxy/pkg/remote"
 
 	proxyconfig "github.com/jacksontj/promxy/pkg/config"
 	"github.com/jacksontj/promxy/pkg/promclient"
@@ -131,7 +132,7 @@ func (p *ProxyStorage) ApplyConfig(c *proxyconfig.Config) error {
 
 		// Whether old or new, update the appender
 		var err error
-		newState.appender, err = newState.remoteStorage.Appender()
+		newState.appender, err = newState.remoteStorage.Appender(context.TODO())
 		if err != nil {
 			return errors.Wrap(err, "unable to create remote_write appender")
 		}
@@ -183,14 +184,14 @@ func (p *ProxyStorage) Close() error { return nil }
 //      - Children cannot be AggregateExpr: aggregates have their own combining logic, so its not safe to send a subquery with additional aggregations
 //      - offsets within the subtree must match: if they don't then we'll get mismatched data, so we wait until we are far enough down the tree that they converge
 //      - Don't reduce accuracy/granularity: the intention of this is to get the correct data faster, meaning correctness overrules speed.
-func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, node promql.Node) (promql.Node, error) {
-	isAgg := func(node promql.Node) bool {
-		_, ok := node.(*promql.AggregateExpr)
+func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *parser.EvalStmt, node parser.Node) (parser.Node, error) {
+	isAgg := func(node parser.Node) bool {
+		_, ok := node.(*parser.AggregateExpr)
 		return ok
 	}
 
-	isSubQuery := func(node promql.Node) bool {
-		_, ok := node.(*promql.SubqueryExpr)
+	isSubQuery := func(node parser.Node) bool {
+		_, ok := node.(*parser.SubqueryExpr)
 		return ok
 	}
 
@@ -199,9 +200,9 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 	aggFinder := &BooleanFinder{Func: isAgg}
 	offsetFinder := &OffsetFinder{}
 
-	visitor := NewMultiVisitor([]promql.Visitor{aggFinder, offsetFinder})
+	visitor := NewMultiVisitor([]parser.Visitor{aggFinder, offsetFinder})
 
-	if _, err := promql.Walk(ctx, visitor, s, node, nil, nil); err != nil {
+	if _, err := parser.Walk(ctx, visitor, node, nil, nil); err != nil {
 		return nil, err
 	}
 
@@ -229,7 +230,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 	// range you ask for (with the offset being implicit)
 	// TODO: rename
 	removeOffset := func() error {
-		_, err := promql.Walk(ctx, &OffsetRemover{}, s, node, nil, nil)
+		_, err := parser.Walk(ctx, &OffsetRemover{}, s, node, nil, nil)
 		return err
 	}
 
@@ -241,12 +242,12 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 	//    (1) create a new eval statement with the subquery times
 	//    (2) run NodeReplacer on that new statement
 	//    (3) replace the subnode with the replaced RawMatrix
-	case *promql.SubqueryExpr:
+	case *parser.SubqueryExpr:
 		logrus.Debugf("SubqueryExpr %v", n)
-		subStmt := &promql.EvalStmt{
+		subStmt := &parser.EvalStmt{
 			Expr:     n.Expr,
 			End:      s.End.Add(-n.Offset),
-			Interval: time.Duration(promql.GetDefaultEvaluationInterval()) * time.Millisecond,
+			Interval: time.Duration(parser.GetDefaultEvaluationInterval()) * time.Millisecond,
 		}
 		if n.Step != 0 {
 			subStmt.Interval = n.Step
@@ -262,12 +263,12 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 			return nil, err
 		}
 		switch subNodeTyped := subNode.(type) {
-		case *promql.AggregateExpr:
-			n.Expr = promql.NewRawMatrixFromVector(subNodeTyped.Expr.(*promql.VectorSelector))
-		case *promql.MatrixSelector:
-			n.Expr = promql.NewRawMatrixFromMatrix(subNodeTyped)
-		case *promql.VectorSelector:
-			n.Expr = promql.NewRawMatrixFromVector(subNodeTyped)
+		case *parser.AggregateExpr:
+			n.Expr = parser.NewRawMatrixFromVector(subNodeTyped.Expr.(*parser.VectorSelector))
+		case *parser.MatrixSelector:
+			n.Expr = parser.NewRawMatrixFromMatrix(subNodeTyped)
+		case *parser.VectorSelector:
+			n.Expr = parser.NewRawMatrixFromVector(subNodeTyped)
 		case nil:
 			break
 		default:
@@ -277,7 +278,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 
 	// Some AggregateExprs can be composed (meaning they are "reentrant". If the aggregation op
 	// is reentrant/composable then we'll do so, otherwise we let it fall through to normal query mechanisms
-	case *promql.AggregateExpr:
+	case *parser.AggregateExpr:
 		logrus.Debugf("AggregateExpr %v %s", n, n.Op)
 
 		var result model.Value
@@ -287,7 +288,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 		// Not all Aggregation functions are composable, so we'll do what we can
 		switch n.Op {
 		// All "reentrant" cases (meaning they can be done repeatedly and the outcome doesn't change)
-		case promql.ItemSum, promql.ItemMin, promql.ItemMax, promql.ItemTopK, promql.ItemBottomK:
+		case parser.ItemSum, parser.ItemMin, parser.ItemMax, parser.ItemTopK, parser.ItemBottomK:
 			removeOffset()
 
 			if s.Interval > 0 {
@@ -305,7 +306,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 			}
 
 		// Convert avg into sum() / count()
-		case promql.ItemAvg:
+		case parser.ItemAvg:
 
 			nameIncluded := false
 			for _, g := range n.Grouping {
@@ -324,26 +325,26 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 					}
 				}
 
-				return &promql.AggregateExpr{
-					Op: promql.ItemMax,
-					Expr: PreserveLabel(&promql.BinaryExpr{
-						Op: promql.ItemDIV,
-						LHS: &promql.AggregateExpr{
-							Op:       promql.ItemSum,
+				return &parser.AggregateExpr{
+					Op: parser.ItemMax,
+					Expr: PreserveLabel(&parser.BinaryExpr{
+						Op: parser.ItemDIV,
+						LHS: &parser.AggregateExpr{
+							Op:       parser.ItemSum,
 							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, MetricNameWorkaroundLabel),
 							Param:    n.Param,
 							Grouping: replacedGrouping,
 							Without:  n.Without,
 						},
 
-						RHS: &promql.AggregateExpr{
-							Op:       promql.ItemCount,
+						RHS: &parser.AggregateExpr{
+							Op:       parser.ItemCount,
 							Expr:     PreserveLabel(CloneExpr(n.Expr), model.MetricNameLabel, MetricNameWorkaroundLabel),
 							Param:    n.Param,
 							Grouping: replacedGrouping,
 							Without:  n.Without,
 						},
-						VectorMatching: &promql.VectorMatching{Card: promql.CardOneToOne},
+						VectorMatching: &parser.VectorMatching{Card: parser.CardOneToOne},
 					}, MetricNameWorkaroundLabel, model.MetricNameLabel),
 					Grouping: n.Grouping,
 					Without:  n.Without,
@@ -352,28 +353,28 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 			}
 
 			// Replace with sum() / count()
-			return &promql.BinaryExpr{
-				Op: promql.ItemDIV,
-				LHS: &promql.AggregateExpr{
-					Op:       promql.ItemSum,
+			return &parser.BinaryExpr{
+				Op: parser.ItemDIV,
+				LHS: &parser.AggregateExpr{
+					Op:       parser.ItemSum,
 					Expr:     CloneExpr(n.Expr),
 					Param:    n.Param,
 					Grouping: n.Grouping,
 					Without:  n.Without,
 				},
 
-				RHS: &promql.AggregateExpr{
-					Op:       promql.ItemCount,
+				RHS: &parser.AggregateExpr{
+					Op:       parser.ItemCount,
 					Expr:     CloneExpr(n.Expr),
 					Param:    n.Param,
 					Grouping: n.Grouping,
 					Without:  n.Without,
 				},
-				VectorMatching: &promql.VectorMatching{Card: promql.CardOneToOne},
+				VectorMatching: &parser.VectorMatching{Card: parser.CardOneToOne},
 			}, nil
 
 		// For count we simply need to change this to a sum over the data we get back
-		case promql.ItemCount:
+		case parser.ItemCount:
 			removeOffset()
 
 			if s.Interval > 0 {
@@ -389,10 +390,10 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 			if err != nil {
 				return nil, errors.Cause(err)
 			}
-			n.Op = promql.ItemSum
+			n.Op = parser.ItemSum
 
 			// To aggregate count_values we simply sum(count_values(key, metric)) by (key)
-		case promql.ItemCountValues:
+		case parser.ItemCountValues:
 
 			// First we must fetch the data into a vectorselector
 			if s.Interval > 0 {
@@ -416,18 +417,18 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 				series[i] = &proxyquerier.Series{iterator}
 			}
 
-			ret := &promql.VectorSelector{Offset: offset}
+			ret := &parser.VectorSelector{Offset: offset}
 			ret.SetSeries(series, promhttputil.WarningsConvert(warnings))
 
 			// Replace with sum(count_values()) BY (label)
-			return &promql.AggregateExpr{
-				Op:       promql.ItemSum,
+			return &parser.AggregateExpr{
+				Op:       parser.ItemSum,
 				Expr:     ret,
-				Grouping: append(n.Grouping, n.Param.(*promql.StringLiteral).Val),
+				Grouping: append(n.Grouping, n.Param.(*parser.StringLiteral).Val),
 				Without:  n.Without,
 			}, nil
 
-		case promql.ItemQuantile:
+		case parser.ItemQuantile:
 			// DO NOTHING
 			// this caltulates an actual quantile over the resulting data
 			// as such there is no way to reduce the load necessary here. If
@@ -436,9 +437,9 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 
 		// Both of these cases require some mechanism of knowing what labels to do the aggregation on.
 		// WIthout that knowledge we require pulling all of the data in, so we do nothing
-		case promql.ItemStddev:
+		case parser.ItemStddev:
 			// DO NOTHING
-		case promql.ItemStdvar:
+		case parser.ItemStdvar:
 			// DO NOTHING
 
 		}
@@ -451,7 +452,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 				series[i] = &proxyquerier.Series{iterator}
 			}
 
-			ret := &promql.VectorSelector{Offset: offset}
+			ret := &parser.VectorSelector{Offset: offset}
 			ret.SetSeries(series, promhttputil.WarningsConvert(warnings))
 			n.Expr = ret
 
@@ -460,7 +461,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 
 	// Call is for things such as rate() etc. This can be sent directly to the
 	// prometheus node to answer
-	case *promql.Call:
+	case *parser.Call:
 		logrus.Debugf("call %v %v", n, n.Type())
 		removeOffset()
 
@@ -487,7 +488,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 			series[i] = &proxyquerier.Series{iterator}
 		}
 
-		ret := &promql.VectorSelector{Offset: offset}
+		ret := &parser.VectorSelector{Offset: offset}
 		ret.SetSeries(series, promhttputil.WarningsConvert(warnings))
 
 		// the "scalar()" function is a bit tricky. It can return a scalar or a vector.
@@ -501,7 +502,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 
 	// If we are simply fetching a Vector then we can fetch the data using the same step that
 	// the query came in as (reducing the amount of data we need to fetch)
-	case *promql.VectorSelector:
+	case *parser.VectorSelector:
 		// If the vector selector already has the data we can skip
 		if n.HasSeries() {
 			return nil, nil
@@ -537,7 +538,7 @@ func (p *ProxyStorage) NodeReplacer(ctx context.Context, s *promql.EvalStmt, nod
 
 	// If we hit this someone is asking for a matrix directly, if so then we don't
 	// have anyway to ask for less-- since this is exactly what they are asking for
-	case *promql.MatrixSelector, *promql.RawMatrix:
+	case *parser.MatrixSelector, *parser.RawMatrix:
 		// DO NOTHING
 
 	default:
